@@ -27,7 +27,7 @@ use nautilus_model::{
     enums::{AccountType, OrderSide, OrderType, PriceType},
     events::{AccountState, OrderFilled},
     identifiers::InstrumentId,
-    instruments::{Instrument, InstrumentAny},
+    instruments::{Instrument, InstrumentAny, QuoteQuantityConversionError},
     orders::{Order, OrderAny},
     position::{Position, fold_net_position},
     types::{
@@ -408,6 +408,13 @@ impl AccountsManager {
 
             let amounts = match Self::cash_order_locks(account, instrument, order, price) {
                 Ok(amounts) => amounts,
+                Err(e) if e.downcast_ref::<QuoteQuantityConversionError>().is_some() => {
+                    log::error!(
+                        "Cannot calculate balance locked for {}: {e}",
+                        order.client_order_id()
+                    );
+                    continue;
+                }
                 Err(e) => {
                     log::error!("Cannot calculate balance locked: {e}");
                     return None;
@@ -502,19 +509,33 @@ impl AccountsManager {
                 continue;
             }
 
-            let quantity = order.leaves_qty();
+            let mut quantity = order.leaves_qty();
             if quantity.is_zero() {
                 continue;
             }
 
-            let locked = match order.order_side() {
-                OrderSide::Sell if order.is_quote_quantity() => {
+            if order.is_sell() && order.is_quote_quantity() && !instrument.is_inverse() {
+                let Some(price) = order.price().or_else(|| order.trigger_price()) else {
                     log::error!(
-                        "Cannot calculate wallet balance locked for quote-denominated SELL order {}",
+                        "Cannot calculate wallet balance locked for {}: quote sell has no price",
                         order.client_order_id()
                     );
-                    return None;
+                    continue;
+                };
+
+                match instrument.order_base_quantity(true, quantity, price) {
+                    Ok(base_qty) => quantity = base_qty,
+                    Err(e) => {
+                        log::error!(
+                            "Cannot calculate wallet balance locked for {}: {e}",
+                            order.client_order_id()
+                        );
+                        continue;
+                    }
                 }
+            }
+
+            let locked = match order.order_side() {
                 OrderSide::Sell => {
                     let source_currency = instrument
                         .base_currency()
@@ -534,7 +555,7 @@ impl AccountsManager {
                         }
                     }
                 }
-                OrderSide::Buy if order.is_quote_quantity() => {
+                OrderSide::Buy if order.is_quote_quantity() && !instrument.is_inverse() => {
                     let source_currency = instrument.quote_currency();
                     let Some(total) = account.balance_total(Some(source_currency)) else {
                         log::error!(
@@ -665,60 +686,83 @@ impl AccountsManager {
                 order.trigger_price()
             };
 
+            let Some(price) = price else {
+                continue;
+            };
+
+            let quantity = if matches!(instrument, InstrumentAny::Betting(_)) {
+                order.leaves_qty()
+            } else {
+                match instrument.order_base_quantity(
+                    order.is_quote_quantity(),
+                    order.leaves_qty(),
+                    price,
+                ) {
+                    Ok(quantity) => quantity,
+                    Err(e) => {
+                        log::error!(
+                            "Cannot calculate initial margin for {}: {e}",
+                            order.client_order_id()
+                        );
+                        continue;
+                    }
+                }
+            };
+
             let margin_init = match instrument {
                 InstrumentAny::Betting(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::BinaryOption(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Cfd(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Commodity(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoFuture(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoFuturesSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoOption(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoOptionSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoPerpetual(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CurrencyPair(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Equity(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::FuturesContract(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::FuturesSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::IndexInstrument(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::OptionContract(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::OptionSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::PerpetualContract(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
                 InstrumentAny::TokenizedAsset(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin(i, quantity, price, None)
                     .ok()?,
             };
 
@@ -1365,6 +1409,15 @@ impl AccountsManager {
     ) -> anyhow::Result<[Option<Money>; 2]> {
         let locked = if order.is_reduce_only() {
             None
+        } else if order.is_quote_quantity() {
+            Some(account.base_calculate_balance_locked(
+                instrument,
+                order.order_side(),
+                order.leaves_qty(),
+                price,
+                None,
+                true,
+            )?)
         } else {
             Some(account.calculate_balance_locked(
                 instrument,
@@ -1379,10 +1432,15 @@ impl AccountsManager {
             && price.is_negative()
             && (order.is_reduce_only() || instrument.base_currency().is_some())
         {
+            let quantity = if order.is_quote_quantity() && !instrument.is_inverse() {
+                instrument.order_base_quantity(true, order.leaves_qty(), -price)?
+            } else {
+                order.leaves_qty()
+            };
             Some(account.calculate_balance_locked(
                 instrument,
                 OrderSide::Buy,
-                order.leaves_qty(),
+                quantity,
                 -price,
                 None,
             )?)
@@ -1558,8 +1616,9 @@ mod tests {
         instruments::{
             CryptoFuture, CurrencyPair, Instrument, InstrumentAny,
             stubs::{
-                audusd_sim, betting, commodity_gold, crypto_future_btcusdt, currency_pair_btcusdt,
-                currency_pair_ethusdt, default_fx_ccy, ethbtc_quanto,
+                audusd_sim, betting, btcusd_bybit, commodity_gold, crypto_future_btcusdt,
+                crypto_perpetual_ethusdt, currency_pair_btcusdt, currency_pair_ethusdt,
+                default_fx_ccy, ethbtc_quanto,
             },
         },
         orders::{OrderAny, OrderTestBuilder},
@@ -2558,6 +2617,297 @@ mod tests {
         } else {
             panic!("Expected CashAccount");
         }
+    }
+
+    #[rstest]
+    fn test_update_orders_quote_quantity_locks_converted_base_quantity() {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_ethusdt());
+        let eth = instrument.base_currency().unwrap();
+        let usdt = instrument.quote_currency();
+        let eth_total = Money::from_decimal(dec!(10), eth).unwrap();
+        let usdt_total = Money::from_decimal(dec!(10_000), usdt).unwrap();
+        let state = AccountState::new(
+            AccountId::new("SIM-QUOTE"),
+            AccountType::Cash,
+            vec![
+                AccountBalance::new(eth_total, Money::zero(eth), eth_total),
+                AccountBalance::new(usdt_total, Money::zero(usdt), usdt_total),
+            ],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let account = AccountAny::Cash(CashAccount::new(state, true, false));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let manager = AccountsManager::new(clock, cache);
+
+        let mut buy = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("200"))
+            .price(Price::from("2.00"))
+            .quote_quantity(true)
+            .build();
+        buy.apply(OrderEventAny::Submitted(order_submitted_for(&buy)))
+            .unwrap();
+        buy.apply(OrderEventAny::Accepted(order_accepted_for(
+            &buy,
+            VenueOrderId::from("B-1"),
+        )))
+        .unwrap();
+
+        let (buy_account, _) = manager
+            .update_orders(&account, &instrument, &[&buy], UnixNanos::default())
+            .unwrap();
+        assert_eq!(
+            buy_account.balance_locked(Some(usdt)).unwrap().as_decimal(),
+            dec!(200)
+        );
+
+        let mut sell = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("4"))
+            .price(Price::from("2.00"))
+            .quote_quantity(true)
+            .build();
+        sell.apply(OrderEventAny::Submitted(order_submitted_for(&sell)))
+            .unwrap();
+        sell.apply(OrderEventAny::Accepted(order_accepted_for(
+            &sell,
+            VenueOrderId::from("S-1"),
+        )))
+        .unwrap();
+
+        let (sell_account, _) = manager
+            .update_orders(&account, &instrument, &[&sell], UnixNanos::default())
+            .unwrap();
+        assert_eq!(
+            sell_account.balance_locked(Some(eth)).unwrap().as_decimal(),
+            dec!(2)
+        );
+
+        let mut zero_price = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-ZERO"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("4"))
+            .price(Price::from("0.00"))
+            .quote_quantity(true)
+            .build();
+        zero_price
+            .apply(OrderEventAny::Submitted(order_submitted_for(&zero_price)))
+            .unwrap();
+        zero_price
+            .apply(OrderEventAny::Accepted(order_accepted_for(
+                &zero_price,
+                VenueOrderId::from("Z-1"),
+            )))
+            .unwrap();
+        let mut sibling = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-BASE"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1"))
+            .price(Price::from("2.00"))
+            .build();
+        sibling
+            .apply(OrderEventAny::Submitted(order_submitted_for(&sibling)))
+            .unwrap();
+        sibling
+            .apply(OrderEventAny::Accepted(order_accepted_for(
+                &sibling,
+                VenueOrderId::from("B-2"),
+            )))
+            .unwrap();
+
+        let (mixed_account, _) = manager
+            .update_orders(
+                &account,
+                &instrument,
+                &[&zero_price, &sibling],
+                UnixNanos::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            mixed_account
+                .balance_locked(Some(eth))
+                .unwrap()
+                .as_decimal(),
+            dec!(1)
+        );
+    }
+
+    #[rstest]
+    fn test_update_orders_inverse_quote_quantity_does_not_convert() {
+        let instrument = InstrumentAny::CryptoPerpetual(btcusd_bybit());
+        let btc = instrument.base_currency().unwrap();
+        let total = Money::from_decimal(dec!(10), btc).unwrap();
+        let state = AccountState::new(
+            AccountId::new("SIM-INVERSE"),
+            AccountType::Cash,
+            vec![AccountBalance::new(total, Money::zero(btc), total)],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let account = AccountAny::Cash(CashAccount::new(state, true, false));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let manager = AccountsManager::new(clock, cache);
+
+        let open_buy = |quote_quantity: bool, client_order_id: &str| {
+            let mut order = OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from(client_order_id))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("4"))
+                .price(Price::from("2.0"))
+                .quote_quantity(quote_quantity)
+                .build();
+            order
+                .apply(OrderEventAny::Submitted(order_submitted_for(&order)))
+                .unwrap();
+            order
+                .apply(OrderEventAny::Accepted(order_accepted_for(
+                    &order,
+                    VenueOrderId::from(client_order_id),
+                )))
+                .unwrap();
+            order
+        };
+
+        let quote_order = open_buy(true, "O-INV-Q");
+        let base_order = open_buy(false, "O-INV-B");
+        let (quote_account, _) = manager
+            .update_orders(&account, &instrument, &[&quote_order], UnixNanos::default())
+            .unwrap();
+        let (base_account, _) = manager
+            .update_orders(&account, &instrument, &[&base_order], UnixNanos::default())
+            .unwrap();
+        assert_eq!(
+            quote_account.balance_locked(Some(btc)),
+            base_account.balance_locked(Some(btc))
+        );
+    }
+
+    #[rstest]
+    fn test_update_orders_quote_quantity_margin_uses_base_quantity() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let usdt = instrument.settlement_currency();
+        let total = Money::from_decimal(dec!(100_000), usdt).unwrap();
+        let state = AccountState::new(
+            AccountId::new("BINANCE-QUOTE"),
+            AccountType::Margin,
+            vec![AccountBalance::new(total, Money::zero(usdt), total)],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let account = AccountAny::Margin(MarginAccount::new(state, true));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let manager = AccountsManager::new(clock, cache);
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("200.000"))
+            .price(Price::from("2.00"))
+            .quote_quantity(true)
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(order_submitted_for(&order)))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(order_accepted_for(
+                &order,
+                VenueOrderId::from("M-1"),
+            )))
+            .unwrap();
+
+        let (account, _) = manager
+            .update_orders(&account, &instrument, &[&order], UnixNanos::default())
+            .unwrap();
+        let AccountAny::Margin(margin_account) = account else {
+            panic!("Expected MarginAccount")
+        };
+        assert_eq!(
+            margin_account
+                .margin(&instrument.id())
+                .unwrap()
+                .initial
+                .as_decimal(),
+            dec!(200)
+        );
+    }
+
+    #[rstest]
+    fn test_update_orders_wallet_quote_sell_locks_base_quantity() {
+        let eth = Currency::ETH();
+        let usdc = Currency::USDC();
+        let account_state = AccountState::new(
+            AccountId::new("WALLET-QUOTE"),
+            AccountType::Wallet,
+            vec![
+                AccountBalance::new(
+                    Money::new(10.0, eth),
+                    Money::zero(eth),
+                    Money::new(10.0, eth),
+                ),
+                AccountBalance::new(
+                    Money::new(25_000.0, usdc),
+                    Money::zero(usdc),
+                    Money::new(25_000.0, usdc),
+                ),
+            ],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let account = WalletAccount::new(account_state, true);
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+        let instrument = currency_pair_ethusdt();
+        let mut sell_order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("4"))
+            .price(Price::from("2.00"))
+            .quote_quantity(true)
+            .build();
+        sell_order
+            .apply(OrderEventAny::Submitted(order_submitted_for(&sell_order)))
+            .unwrap();
+
+        let result = manager.update_orders(
+            &AccountAny::Wallet(account),
+            &InstrumentAny::CurrencyPair(instrument),
+            &[&sell_order],
+            UnixNanos::default(),
+        );
+
+        let (updated_account, _) = result.unwrap();
+        let AccountAny::Wallet(wallet_account) = &updated_account else {
+            panic!("Expected WalletAccount")
+        };
+        assert_eq!(
+            wallet_account.balance_locked(Some(eth)),
+            Some(Money::new(2.0, eth))
+        );
     }
 
     #[rstest]

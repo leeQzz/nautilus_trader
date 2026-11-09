@@ -618,6 +618,7 @@ impl Account for WalletAccount {
             quantity,
             price,
             use_quote_for_inverse,
+            false,
         )?;
         Self::normalize_reservation(locked, current_balance.currency).map_err(Into::into)
     }

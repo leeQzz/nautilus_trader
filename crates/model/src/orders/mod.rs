@@ -92,6 +92,7 @@ use crate::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
         StrategyId, Symbol, TradeId, TraderId, Venue, VenueOrderId,
     },
+    instruments::{Instrument, InstrumentAny},
     orderbook::OwnBookOrder,
     reports::OrderStatusReport,
     types::{Currency, Money, Price, Quantity},
@@ -786,6 +787,30 @@ pub struct OrderCore {
     pub ts_accepted: Option<UnixNanos>,
     pub ts_closed: Option<UnixNanos>,
     pub ts_last: UnixNanos,
+}
+
+/// Returns whether `quantity` would reduce an open position.
+///
+/// `quantity` is in the same units as `position_qty`. Quote orders must be converted
+/// to base units before this comparison.
+#[must_use]
+pub fn quantity_would_reduce_only(
+    order_side: OrderSide,
+    quantity: Quantity,
+    position_side: PositionSide,
+    position_qty: Quantity,
+) -> bool {
+    if position_side == PositionSide::Flat {
+        return false;
+    }
+
+    match (order_side, position_side) {
+        (OrderSide::Buy, PositionSide::Long) => false,
+        (OrderSide::Buy, PositionSide::Short) => quantity <= position_qty,
+        (OrderSide::Sell, PositionSide::Short) => false,
+        (OrderSide::Sell, PositionSide::Long) => quantity <= position_qty,
+        (_, PositionSide::Flat) => false,
+    }
 }
 
 impl OrderCore {
@@ -1772,17 +1797,34 @@ impl OrderCore {
 
     #[must_use]
     pub fn would_reduce_only(&self, side: PositionSide, position_qty: Quantity) -> bool {
-        if side == PositionSide::Flat {
-            return false;
-        }
+        quantity_would_reduce_only(self.side, self.leaves_qty, side, position_qty)
+    }
 
-        match (self.side, side) {
-            (OrderSide::Buy, PositionSide::Long) => false,
-            (OrderSide::Buy, PositionSide::Short) => self.leaves_qty <= position_qty,
-            (OrderSide::Sell, PositionSide::Short) => false,
-            (OrderSide::Sell, PositionSide::Long) => self.leaves_qty <= position_qty,
-            (_, PositionSide::Flat) => false,
-        }
+    /// Returns whether this order would reduce `position_qty` after converting a quote
+    /// quantity to base units at `price`.
+    ///
+    /// Linear quote quantity uses the same division as [`Instrument::order_base_quantity`].
+    /// Inverse contracts are compared without conversion. Callers that adjust the price
+    /// against the current quote, such as the risk engine, pass that adjusted price.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a linear quote quantity cannot be converted at `price`.
+    pub fn would_reduce_only_base(
+        &self,
+        side: PositionSide,
+        position_qty: Quantity,
+        instrument: &InstrumentAny,
+        price: Price,
+    ) -> anyhow::Result<bool> {
+        let quantity =
+            instrument.order_base_quantity(self.is_quote_quantity, self.leaves_qty, price)?;
+        Ok(quantity_would_reduce_only(
+            self.side,
+            quantity,
+            side,
+            position_qty,
+        ))
     }
 
     #[must_use]
@@ -1876,7 +1918,10 @@ mod tests {
             OrderTriggeredSpec, OrderUpdatedSpec,
         },
         identifiers::InstrumentId,
-        instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
+        instruments::{
+            CurrencyPair, Instrument, InstrumentAny,
+            stubs::{audusd_sim, btcusd_bybit},
+        },
         orders::{MarketOrder, builder::OrderTestBuilder, stubs::TestOrderStubs},
         stubs::TestDefault,
         types::{
@@ -1959,6 +2004,40 @@ mod tests {
             order.would_reduce_only(position_side, position_qty),
             expected
         );
+    }
+
+    #[rstest]
+    fn test_would_reduce_only_base_converts_quote_quantity() {
+        let linear = InstrumentAny::CurrencyPair(audusd_sim());
+        let inverse = InstrumentAny::CryptoPerpetual(btcusd_bybit());
+        let position_qty = Quantity::from("1000");
+
+        let reduces = |quantity: &str, price: &str, instrument: &InstrumentAny| {
+            let order = OrderCore::new(
+                OrderInitializedSpec::builder()
+                    .order_side(OrderSide::Sell)
+                    .order_type(OrderType::Limit)
+                    .quantity(Quantity::from(quantity))
+                    .price(Price::from(price))
+                    .quote_quantity(true)
+                    .build(),
+            );
+            order
+                .would_reduce_only_base(
+                    PositionSide::Long,
+                    position_qty,
+                    instrument,
+                    Price::from(price),
+                )
+                .unwrap()
+        };
+
+        // Quote 1500 at price 2 is base 750 and reduces a 1000 position.
+        assert!(reduces("1500", "2", &linear));
+        // Quote 800 at price 0.5 is base 1600 and exceeds the position.
+        assert!(!reduces("800", "0.5", &linear));
+        // Inverse contracts compare the quote quantity without conversion.
+        assert!(!reduces("1500", "2", &inverse));
     }
 
     #[rstest]

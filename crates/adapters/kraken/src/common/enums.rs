@@ -891,21 +891,22 @@ impl From<KrakenFuturesHistoryOrderType> for KrakenFuturesOrderType {
     }
 }
 
-impl From<KrakenFuturesOrderType> for OrderType {
-    fn from(value: KrakenFuturesOrderType) -> Self {
+impl TryFrom<KrakenFuturesOrderType> for OrderType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: KrakenFuturesOrderType) -> Result<Self, Self::Error> {
         match value {
             KrakenFuturesOrderType::Limit
             | KrakenFuturesOrderType::Ioc
-            | KrakenFuturesOrderType::Post => Self::Limit,
-            KrakenFuturesOrderType::Market => Self::Market,
-            KrakenFuturesOrderType::Stop | KrakenFuturesOrderType::StopLower => Self::StopMarket,
-            KrakenFuturesOrderType::TakeProfit => Self::MarketIfTouched,
-            KrakenFuturesOrderType::StopLoss => Self::StopMarket,
+            | KrakenFuturesOrderType::Post => Ok(Self::Limit),
+            KrakenFuturesOrderType::Market => Ok(Self::Market),
+            KrakenFuturesOrderType::Stop | KrakenFuturesOrderType::StopLower => {
+                Ok(Self::StopMarket)
+            }
+            KrakenFuturesOrderType::TakeProfit => Ok(Self::MarketIfTouched),
+            KrakenFuturesOrderType::StopLoss => Ok(Self::StopMarket),
             KrakenFuturesOrderType::Unknown => {
-                log::warn!(
-                    "KrakenFuturesOrderType::Unknown received from venue, defaulting to Market"
-                );
-                Self::Market
+                anyhow::bail!("Kraken futures order type is unknown and cannot be routed")
             }
         }
     }
@@ -1125,11 +1126,10 @@ mod tests {
     }
 
     #[rstest]
-    fn test_futures_order_type_unknown_maps_to_market_default() {
-        assert_eq!(
-            OrderType::from(KrakenFuturesOrderType::Unknown),
-            OrderType::Market,
-        );
+    fn test_futures_order_type_unknown_does_not_map_to_market() {
+        let error = OrderType::try_from(KrakenFuturesOrderType::Unknown)
+            .expect_err("unknown futures order type must not become a routable order type");
+        assert!(error.to_string().contains("unknown"));
     }
 
     #[rstest]

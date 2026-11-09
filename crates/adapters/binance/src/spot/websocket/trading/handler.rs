@@ -602,6 +602,28 @@ impl BinanceSpotWsTradingHandler {
                         }
                     }
                 }
+                604 => {
+                    log::debug!(
+                        "Received SBE ExternalLockUpdateEvent ({} bytes)",
+                        data.len()
+                    );
+                    return Ok(match super::decode_sbe::decode_external_lock_update(data) {
+                        Ok(msg) => {
+                            log::debug!(
+                                "SBE external lock update: asset={}, delta={}",
+                                msg.asset,
+                                msg.delta
+                            );
+                            BinanceSpotWsTradingMessage::ExternalLockUpdate(msg)
+                        }
+                        Err(e) => {
+                            log::error!("Failed to decode SBE ExternalLockUpdateEvent: {e}");
+                            BinanceSpotWsTradingMessage::BalanceError(format!(
+                                "SBE ExternalLockUpdateEvent decode failed: {e}"
+                            ))
+                        }
+                    });
+                }
                 603 => {
                     log::debug!("Received SBE ExecutionReportEvent ({} bytes)", data.len());
                     match super::decode_sbe::decode_execution_report(data) {
@@ -943,8 +965,27 @@ pub(crate) fn classify_user_data_event(
             let event_time = event.get("E").and_then(|v| v.as_i64()).unwrap_or_default();
             Some(BinanceSpotWsTradingMessage::ServerShutdown { event_time })
         }
+        BinanceSpotUserDataEventType::ExternalLockUpdate => {
+            match serde_json::from_value::<super::user_data::BinanceSpotExternalLockUpdateMsg>(
+                event.clone(),
+            ) {
+                Ok(msg) => {
+                    log::debug!(
+                        "External lock update: asset={}, delta={}",
+                        msg.asset,
+                        msg.delta
+                    );
+                    Some(BinanceSpotWsTradingMessage::ExternalLockUpdate(msg))
+                }
+                Err(e) => {
+                    log::error!("Failed to parse external lock update: {e}");
+                    Some(BinanceSpotWsTradingMessage::BalanceError(format!(
+                        "externalLockUpdate decode failed: {e}"
+                    )))
+                }
+            }
+        }
         BinanceSpotUserDataEventType::ListenKeyExpired
-        | BinanceSpotUserDataEventType::ExternalLockUpdate
         | BinanceSpotUserDataEventType::EventStreamTerminated
         | BinanceSpotUserDataEventType::Unknown => {
             log::debug!("Unhandled user data event type: {event_type:?}");
@@ -1319,6 +1360,64 @@ mod tests {
     fn test_classify_user_data_event_unknown_returns_none() {
         let event = serde_json::json!({"e": "somethingElse"});
         assert!(classify_user_data_event(&event).is_none());
+    }
+
+    #[rstest]
+    fn test_classify_user_data_event_external_lock_update() {
+        let event = serde_json::json!({
+            "e": "externalLockUpdate",
+            "E": 1_700_000_000_000_i64,
+            "a": "BTC",
+            "d": "0.25",
+            "T": 1_700_000_000_100_i64,
+        });
+        let msg = classify_user_data_event(&event).expect("expected ExternalLockUpdate");
+        match msg {
+            BinanceSpotWsTradingMessage::ExternalLockUpdate(update) => {
+                assert_eq!(update.asset.as_str(), "BTC");
+                assert_eq!(update.delta, "0.25");
+                assert_eq!(update.event_time, 1_700_000_000_000);
+                assert_eq!(update.clear_time, 1_700_000_000_100);
+            }
+            other => panic!("expected ExternalLockUpdate variant, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_classify_user_data_event_external_lock_update_decode_failure_is_balance_error() {
+        let event = serde_json::json!({"e": "externalLockUpdate", "a": "BTC"});
+        match classify_user_data_event(&event).expect("expected BalanceError") {
+            BinanceSpotWsTradingMessage::BalanceError(reason) => {
+                assert!(reason.contains("externalLockUpdate"));
+            }
+            other => panic!("expected BalanceError variant, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_decode_external_lock_update_failure_is_balance_error() {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = BinanceSpotWsTradingHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            Arc::new(SigningCredential::new(
+                "api-key".to_owned(),
+                "secret".to_owned(),
+            )),
+        );
+        let mut data = vec![0u8; 8];
+        data[2..4].copy_from_slice(&604_u16.to_le_bytes());
+
+        match handler.decode_ws_api_response(&data).unwrap() {
+            BinanceSpotWsTradingMessage::BalanceError(reason) => {
+                assert!(reason.contains("ExternalLockUpdateEvent"));
+            }
+            other => panic!("expected BalanceError variant, was {other:?}"),
+        }
     }
 
     #[rstest]

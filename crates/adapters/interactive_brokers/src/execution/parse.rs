@@ -437,6 +437,12 @@ pub(crate) fn should_use_avg_fill_price(avg_fill_price: f64, instrument_id: &Ins
         && (avg_fill_price > 0.0 || is_spread_instrument_id(instrument_id))
 }
 
+fn nautilus_order_status(status: &str) -> anyhow::Result<NautilusOrderStatus> {
+    IbOrderStatus::from_str(status)
+        .map(IbOrderStatus::nautilus_status)
+        .with_context(|| format!("Unknown IB order status: {status}"))
+}
+
 pub(crate) fn ib_venue_order_id(order_id: i32, perm_id: i64) -> VenueOrderId {
     if perm_id != 0 {
         VenueOrderId::new(format!("PERM-{perm_id}"))
@@ -564,19 +570,16 @@ pub fn parse_order_status_to_report(
     instrument_provider: &InteractiveBrokersInstrumentProvider,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
+    let Some(instrument) = instrument_provider.find(&instrument_id) else {
+        anyhow::bail!("Instrument not found for {instrument_id}");
+    };
+    let size_precision = instrument.size_precision();
+    let price_precision = instrument.price_precision();
+
     // Get price magnifier from instrument provider
     let price_magnifier = instrument_provider.get_price_magnifier(&instrument_id);
 
-    let mut nautilus_status = match IbOrderStatus::from_str(order_status.status.as_str()) {
-        Ok(status) => status.nautilus_status(),
-        _ => {
-            tracing::warn!(
-                "Unknown order status: {}, defaulting to SUBMITTED",
-                order_status.status.as_str()
-            );
-            NautilusOrderStatus::Submitted
-        }
-    };
+    let mut nautilus_status = nautilus_order_status(order_status.status.as_str())?;
 
     // Get order side
     let order_side = if let Some(order) = order {
@@ -585,16 +588,6 @@ pub fn parse_order_status_to_report(
         // Default to Buy if order not available
         OrderSide::Buy
     };
-
-    let instrument = instrument_provider.find(&instrument_id);
-
-    // Get instrument for precision (use 0 as default if not available)
-    let size_precision = instrument
-        .as_ref()
-        .map_or(0, |instr| instr.size_precision());
-    let price_precision = instrument
-        .as_ref()
-        .map_or(0, |instr| instr.price_precision());
 
     // Get quantity
     let total_quantity = order.map_or(0.0, |order| order.total_quantity);
@@ -947,7 +940,7 @@ mod tests {
         enums::{AssetClass, PositionSide, TrailingOffsetType, TriggerType},
         identifiers::{Symbol, Venue},
         instruments::{
-            CurrencyPair, FuturesContract, InstrumentAny,
+            CurrencyPair, Equity, FuturesContract, InstrumentAny,
             stubs::{equity_aapl, equity_aapl_itch},
         },
     };
@@ -967,7 +960,32 @@ mod tests {
 
     fn create_test_instrument_provider() -> InteractiveBrokersInstrumentProvider {
         let config = InteractiveBrokersInstrumentProviderConfig::default();
-        InteractiveBrokersInstrumentProvider::new(config).unwrap()
+        let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
+        register_test_equity(&provider, create_test_instrument_id(), 0);
+        provider
+    }
+
+    fn register_test_equity(
+        provider: &InteractiveBrokersInstrumentProvider,
+        instrument_id: InstrumentId,
+        price_precision: u8,
+    ) {
+        let price_increment = match price_precision {
+            0 => Price::new(1.0, 0),
+            2 => Price::from("0.01"),
+            precision => panic!("test equity precision {precision} is not registered"),
+        };
+        let equity = Equity::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(instrument_id.symbol)
+            .currency(Currency::from("USD"))
+            .price_precision(price_precision)
+            .price_increment(price_increment)
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        provider.insert_test_instrument(InstrumentAny::Equity(equity), 1, 1);
     }
 
     fn create_test_instrument_id() -> InstrumentId {
@@ -1754,14 +1772,50 @@ mod tests {
             UnixNanos::new(0),
         );
 
-        // May fail if instrument not in provider, but that's expected
-        if let Err(e) = result {
-            let error_msg = e.to_string();
-            assert!(
-                error_msg.contains("not found") || error_msg.contains("instrument"),
-                "Unexpected error: {error_msg}"
-            );
-        }
+        let report = result.expect("registered instrument should produce a report");
+        assert_eq!(report.order_status, NautilusOrderStatus::Accepted);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_to_report_missing_instrument_does_not_emit_report() {
+        let instrument_provider = InteractiveBrokersInstrumentProvider::new(
+            InteractiveBrokersInstrumentProviderConfig::default(),
+        )
+        .unwrap();
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::Submitted,
+            filled: 0.0,
+            remaining: 100.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+
+        let error = parse_order_status_to_report(
+            &order_status,
+            None,
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .expect_err("missing instrument must not produce a report");
+
+        assert!(error.to_string().contains("Instrument not found"));
+    }
+
+    #[rstest]
+    fn test_unknown_ib_order_status_is_not_submitted() {
+        let error = nautilus_order_status("NotAStatus")
+            .expect_err("an unmapped IB status must not become Submitted");
+        let message = error.to_string();
+        assert!(message.contains("Unknown IB order status"));
+        assert!(!message.contains("SUBMITTED"));
     }
 
     #[rstest]
@@ -1784,23 +1838,17 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
-        let result = parse_order_status_to_report(
+        let report = parse_order_status_to_report(
             &order_status,
             None,
             instrument_id,
             account_id,
             &instrument_provider,
             UnixNanos::new(0),
-        );
+        )
+        .expect("registered instrument should produce a report");
 
-        // May fail if instrument not in provider, but that's expected
-        if let Err(e) = result {
-            let error_msg = e.to_string();
-            assert!(
-                error_msg.contains("not found") || error_msg.contains("instrument"),
-                "Unexpected error: {error_msg}"
-            );
-        }
+        assert_eq!(report.order_status, NautilusOrderStatus::Filled);
     }
 
     #[rstest]
@@ -1811,6 +1859,7 @@ mod tests {
             Symbol::from("(1)SPY C400___((1))SPY C410"),
             Venue::from("SMART"),
         );
+        register_test_equity(&instrument_provider, instrument_id, 2);
         let account_id = AccountId::from("IB-001");
 
         let order_status = OrderStatus {

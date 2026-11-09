@@ -3149,9 +3149,7 @@ impl OrderMatchingEngine {
     /// The venue calls this after delivering a cross-instrument release, using its `parent_order_id`
     /// and `parent_quantity`, because the released child may have filled.
     ///
-    /// # Panics
-    ///
-    /// Panics if a linked child order is missing from the cache.
+    /// A missing child, or a child whose deferred update cannot be applied, is logged and skipped.
     pub fn process_oto_resize(&mut self, parent_order_id: ClientOrderId, quantity: Quantity) {
         if let Some(parent) = self.order_snapshot(parent_order_id) {
             self.update_oto_children(&parent, Some(quantity), &[]);
@@ -7963,9 +7961,10 @@ impl OrderMatchingEngine {
         ids: &[ClientOrderId],
         sizing: &OtoSizing,
     ) -> bool {
-        let mut child = self
-            .order_snapshot(id)
-            .unwrap_or_else(|| panic!("Cannot find contingent order for {id}"));
+        let Some(mut child) = self.order_snapshot(id) else {
+            log::error!("Cannot find contingent order for {id}");
+            return false;
+        };
         let elsewhere = self.works_in_another_engine(&child);
         let accepted_elsewhere = elsewhere && self.cache.borrow().venue_order_id(&id).is_some();
         if let Err(e) = self.apply_deferred_submission(&mut child, accepted_elsewhere) {
