@@ -42,6 +42,7 @@ pub mod error;
 pub mod handler;
 pub mod messages;
 pub mod parse;
+pub mod recovery;
 pub mod user_data;
 
 pub use client::BinanceSpotWsTradingClient;

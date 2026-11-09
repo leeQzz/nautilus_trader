@@ -284,11 +284,11 @@ explicit quantity and `reduce_only` instead.
 
 The states become progressively more restrictive:
 
-| State      | Numeric value | Permitted commands                                                           |
-| ---------- | ------------: | ---------------------------------------------------------------------------- |
-| `ACTIVE`   |             1 | Submit, modify, cancel, and query commands operate normally.                 |
-| `REDUCING` |             2 | Eligible individual reduce-only submissions, cancels, and queries.           |
-| `HALTED`   |             3 | Cancels and queries only. New submissions and modifications are not allowed. |
+| State      | Numeric value | Permitted commands                                                            |
+| ---------- | ------------: | ----------------------------------------------------------------------------- |
+| `ACTIVE`   |             1 | Submit, modify, cancel, and query commands operate normally.                  |
+| `REDUCING` |             2 | Eligible reduce-only orders and all-reducing lists, plus cancels and queries. |
+| `HALTED`   |             3 | Cancels and queries only. New submissions and modifications are not allowed.  |
 
 In `REDUCING`, an individual `SubmitOrder` is eligible only when all of these conditions hold:
 
@@ -299,7 +299,10 @@ In `REDUCING`, an individual `SubmitOrder` is eligible only when all of these co
 - The order side opposes the position.
 - The submitted quantity does not exceed the cached position quantity.
 
-Order lists and modifications are denied.
+A `SubmitOrderList` is one command. It is forwarded only when every order meets the conditions
+above, using that order's own instrument. If any leg does not reduce, the list is not split or
+submitted: non-reducing legs are denied with `TRADING_STATE_REDUCING`, and reducing legs are denied
+with `ORDER_LIST_DENIED`. Modifications are denied.
 
 The risk engine applies these rules before forwarding commands to execution. Released emulated orders follow the same
 rules: a protective stop must set `reduce_only=true` and satisfy the conditions above to pass in
