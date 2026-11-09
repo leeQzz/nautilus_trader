@@ -186,6 +186,20 @@ pub enum BinanceSpotWsTradingMessage {
         /// Event time in milliseconds.
         event_time: i64,
     },
+    /// Listen key expired on a legacy user data stream.
+    ///
+    /// The execution client rotates the key and reconciles order status.
+    ListenKeyExpired {
+        /// Event time in milliseconds.
+        event_time: i64,
+    },
+    /// User data event stream terminated.
+    ///
+    /// The execution client resumes the stream and reconciles order status.
+    EventStreamTerminated {
+        /// Event time in milliseconds.
+        event_time: i64,
+    },
     /// Error from venue or network.
     Error(String),
 }

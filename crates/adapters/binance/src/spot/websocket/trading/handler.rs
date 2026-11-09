@@ -556,9 +556,18 @@ impl BinanceSpotWsTradingHandler {
             return;
         }
 
-        // Stream termination event
+        // Legacy termination frame; wrapped and `"e"` events are classified below
         if json.get("eventStreamTerminated").is_some() {
-            log::warn!("User data stream terminated, resubscribe needed");
+            let event_time = json
+                .get("eventStreamTerminated")
+                .and_then(|value| value.get("E"))
+                .and_then(|value| value.as_i64())
+                .or_else(|| json.get("E").and_then(|value| value.as_i64()))
+                .unwrap_or_default();
+            log::warn!(
+                "Binance Spot user data stream terminated at {event_time}, recovery required"
+            );
+            self.emit(BinanceSpotWsTradingMessage::EventStreamTerminated { event_time });
             return;
         }
 
@@ -651,6 +660,12 @@ impl BinanceSpotWsTradingHandler {
                             )));
                         }
                     }
+                }
+                602 => {
+                    // Template 602 stores event time as microseconds immediately after the
+                    // header, the same layout as template 610.
+                    let event_time = parse_server_shutdown_event_time_ms(data);
+                    return Ok(BinanceSpotWsTradingMessage::EventStreamTerminated { event_time });
                 }
                 610 => {
                     let event_time = parse_server_shutdown_event_time_ms(data);
@@ -943,9 +958,15 @@ pub(crate) fn classify_user_data_event(
             let event_time = event.get("E").and_then(|v| v.as_i64()).unwrap_or_default();
             Some(BinanceSpotWsTradingMessage::ServerShutdown { event_time })
         }
-        BinanceSpotUserDataEventType::ListenKeyExpired
-        | BinanceSpotUserDataEventType::ExternalLockUpdate
-        | BinanceSpotUserDataEventType::EventStreamTerminated
+        BinanceSpotUserDataEventType::ListenKeyExpired => {
+            let event_time = event.get("E").and_then(|v| v.as_i64()).unwrap_or_default();
+            Some(BinanceSpotWsTradingMessage::ListenKeyExpired { event_time })
+        }
+        BinanceSpotUserDataEventType::EventStreamTerminated => {
+            let event_time = event.get("E").and_then(|v| v.as_i64()).unwrap_or_default();
+            Some(BinanceSpotWsTradingMessage::EventStreamTerminated { event_time })
+        }
+        BinanceSpotUserDataEventType::ExternalLockUpdate
         | BinanceSpotUserDataEventType::Unknown => {
             log::debug!("Unhandled user data event type: {event_type:?}");
             None
@@ -1359,5 +1380,121 @@ mod tests {
 
         assert_eq!(signed["recvWindow"], 45_000);
         assert_eq!(signature, credential.sign(&query));
+    }
+
+    fn test_handler() -> (
+        BinanceSpotWsTradingHandler,
+        tokio::sync::mpsc::UnboundedReceiver<BinanceSpotWsTradingMessage>,
+    ) {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = BinanceSpotWsTradingHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            Arc::new(SigningCredential::new(
+                "api-key".to_string(),
+                "secret".to_string(),
+            )),
+        );
+        (handler, out_rx)
+    }
+
+    fn assert_recovery_signaled(message: &BinanceSpotWsTradingMessage) {
+        use super::super::recovery::{SpotUserStreamRecoveryKind, signal_user_stream_recovery};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(signal_user_stream_recovery(message, &tx));
+        let kind = rx.try_recv().expect("recovery signal");
+
+        match message {
+            BinanceSpotWsTradingMessage::ListenKeyExpired { .. } => {
+                assert_eq!(kind, SpotUserStreamRecoveryKind::ListenKeyExpired);
+            }
+            BinanceSpotWsTradingMessage::EventStreamTerminated { .. } => {
+                assert_eq!(kind, SpotUserStreamRecoveryKind::EventStreamTerminated);
+            }
+            other => panic!("unexpected recovery message: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::listen_key(r#"{"e":"listenKeyExpired","E":42}"#, 42)]
+    #[case::event_stream(r#"{"e":"eventStreamTerminated","E":43}"#, 43)]
+    fn test_classify_user_stream_expiry_requests_recovery(
+        #[case] text: &str,
+        #[case] event_time: i64,
+    ) {
+        let event: serde_json::Value = serde_json::from_str(text).unwrap();
+        let message = classify_user_data_event(&event).expect("expiry event must not be dropped");
+        match &message {
+            BinanceSpotWsTradingMessage::ListenKeyExpired { event_time: actual }
+            | BinanceSpotWsTradingMessage::EventStreamTerminated { event_time: actual } => {
+                assert_eq!(*actual, event_time);
+            }
+            other => panic!("expected a recovery event, was {other:?}"),
+        }
+        assert_recovery_signaled(&message);
+    }
+
+    #[rstest]
+    fn test_classify_external_lock_update_stays_dropped() {
+        let event = serde_json::json!({"e": "externalLockUpdate", "E": 1});
+        assert!(classify_user_data_event(&event).is_none());
+    }
+
+    #[rstest]
+    fn test_handle_text_response_emits_wrapped_listen_key_expired() {
+        let (mut handler, mut out_rx) = test_handler();
+        let text = r#"{"subscriptionId":1,"event":{"e":"listenKeyExpired","E":1700000000000}}"#;
+        handler.handle_text_response(text);
+        let message = out_rx.try_recv().expect("listen key expiry was dropped");
+        match message {
+            BinanceSpotWsTradingMessage::ListenKeyExpired { event_time } => {
+                assert_eq!(event_time, 1_700_000_000_000);
+                assert_recovery_signaled(&BinanceSpotWsTradingMessage::ListenKeyExpired {
+                    event_time,
+                });
+            }
+            other => panic!("expected ListenKeyExpired, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_handle_text_response_emits_event_stream_terminated() {
+        let (mut handler, mut out_rx) = test_handler();
+        handler.handle_text_response(r#"{"eventStreamTerminated":{"E":44}}"#);
+        let message = out_rx.try_recv().expect("stream termination was dropped");
+        match message {
+            BinanceSpotWsTradingMessage::EventStreamTerminated { event_time } => {
+                assert_eq!(event_time, 44);
+                assert_recovery_signaled(&BinanceSpotWsTradingMessage::EventStreamTerminated {
+                    event_time,
+                });
+            }
+            other => panic!("expected EventStreamTerminated, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_decode_sbe_event_stream_terminated_requests_recovery() {
+        let (mut handler, _out_rx) = test_handler();
+        let mut buf = vec![0u8; message_header_codec::ENCODED_LENGTH + 8];
+        buf[2..4].copy_from_slice(&602u16.to_le_bytes());
+        buf[message_header_codec::ENCODED_LENGTH..]
+            .copy_from_slice(&(1_700_000_000_000_000i64).to_le_bytes());
+
+        let message = handler.decode_ws_api_response(&buf).unwrap();
+        match message {
+            BinanceSpotWsTradingMessage::EventStreamTerminated { event_time } => {
+                assert_eq!(event_time, 1_700_000_000_000);
+                assert_recovery_signaled(&BinanceSpotWsTradingMessage::EventStreamTerminated {
+                    event_time,
+                });
+            }
+            other => panic!("expected EventStreamTerminated, was {other:?}"),
+        }
     }
 }

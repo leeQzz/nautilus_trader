@@ -62,7 +62,7 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
@@ -72,6 +72,10 @@ use super::websocket::trading::{
     parse::{
         parse_spot_account_position, parse_spot_exec_report_to_fill,
         parse_spot_exec_report_to_order_status,
+    },
+    recovery::{
+        SpotUserStreamRecovery, SpotUserStreamResume, run_spot_user_stream_recovery,
+        signal_user_stream_recovery,
     },
     user_data::{BinanceSpotExecutionReport, BinanceSpotExecutionType, BinanceSpotListStatus},
 };
@@ -148,7 +152,7 @@ pub struct BinanceSpotExecutionClient {
     ws_trading_dispatch: Option<TaskRef>,
     ws_user_data_client: Arc<Mutex<Option<BinanceSpotWsTradingClient>>>,
     ws_user_data_dispatch: Option<TaskRef>,
-    listen_key: Option<SecretString>,
+    listen_key: Arc<RwLock<Option<SecretString>>>,
     us_credentials: Option<(SecretString, SecretString)>,
     ws_authenticated: Arc<tokio::sync::Notify>,
     ws_user_data_subscribed: Arc<tokio::sync::Notify>,
@@ -254,7 +258,7 @@ impl BinanceSpotExecutionClient {
             ws_trading_dispatch: None,
             ws_user_data_client: Arc::new(Mutex::new(None)),
             ws_user_data_dispatch: None,
-            listen_key: None,
+            listen_key: Arc::new(RwLock::new(None)),
             us_credentials,
             ws_authenticated: Arc::new(tokio::sync::Notify::new()),
             ws_user_data_subscribed: Arc::new(tokio::sync::Notify::new()),
@@ -746,7 +750,7 @@ impl BinanceSpotExecutionClient {
             .await
             .context("failed to create Binance US listen key")?;
         let listen_key = response.into_listen_key();
-        self.listen_key = Some(listen_key.clone());
+        *self.listen_key.write() = Some(listen_key.clone());
         let url = get_spot_user_stream_url(
             self.config.base_url_ws.as_deref(),
             listen_key.expose_secret(),
@@ -771,7 +775,37 @@ impl BinanceSpotExecutionClient {
             .await
             .context("failed to connect Binance US user data stream")?;
 
-        let ws_clone = ws_user_data.clone();
+        let (recovery_tx, recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (generation_tx, mut generation_rx) = tokio::sync::watch::channel(0u64);
+        let user_data_clients = Arc::clone(&self.ws_user_data_client);
+        let credentials = self
+            .us_credentials
+            .clone()
+            .context("Binance US user data credentials are unavailable")?;
+        let recovery = SpotUserStreamRecovery {
+            http_client: self.http_client.clone(),
+            emitter: self.emitter.clone(),
+            account_id: self.core.account_id,
+            clock: self.clock,
+            instrument_provider: self.config.instrument_provider.clone(),
+            dispatch_state: Arc::clone(&self.dispatch_state),
+            treat_expired_as_canceled: self.config.treat_expired_as_canceled,
+            resume: SpotUserStreamResume::UsListenKey {
+                user_data_client: Arc::clone(&user_data_clients),
+                listen_key: Arc::clone(&self.listen_key),
+                generation: generation_tx,
+                credentials,
+                base_url_ws: self.config.base_url_ws.clone(),
+                proxy_url: self.config.proxy_url.clone(),
+                transport_backend: self.config.transport_backend,
+                socket_factory: self.socket_factory.clone(),
+            },
+        };
+
+        self.session_tasks.spawn(async move {
+            run_spot_user_stream_recovery(recovery, recovery_rx).await;
+        })?;
+
         let emitter = self.emitter.clone();
         let account_id = self.core.account_id;
         let clock = self.clock;
@@ -789,25 +823,48 @@ impl BinanceSpotExecutionClient {
             .context("Binance Spot session task admission is closed")?;
 
         let future = async move {
-            while let Some(message) = ws_clone.recv().await {
-                if matches!(&message, BinanceSpotWsTradingMessage::Reconnected) {
-                    ws_clone.mark_user_data_active();
+            loop {
+                let client = user_data_clients.lock().clone();
+                let Some(client) = client else {
+                    if generation_rx.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+
+                match client.recv().await {
+                    Some(message) => {
+                        signal_user_stream_recovery(&message, &recovery_tx);
+                        if matches!(&message, BinanceSpotWsTradingMessage::Reconnected) {
+                            client.mark_user_data_active();
+                        }
+                        let _lifecycle_guard = lifecycle_lock.lock();
+                        dispatch_ws_trading_message(
+                            message,
+                            &emitter,
+                            &http_client,
+                            account_id,
+                            treat_expired_as_canceled,
+                            clock,
+                            &dispatch_state,
+                            &ws_authenticated,
+                            &ws_user_data_subscribed,
+                            &setup_error_tx,
+                            &seen_trade_ids,
+                            &task_spawner,
+                        );
+                    }
+                    None => {
+                        if generation_rx.has_changed().unwrap_or(false) {
+                            let _ = generation_rx.borrow_and_update();
+                            continue;
+                        }
+
+                        if generation_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
                 }
-                let _lifecycle_guard = lifecycle_lock.lock();
-                dispatch_ws_trading_message(
-                    message,
-                    &emitter,
-                    &http_client,
-                    account_id,
-                    treat_expired_as_canceled,
-                    clock,
-                    &dispatch_state,
-                    &ws_authenticated,
-                    &ws_user_data_subscribed,
-                    &setup_error_tx,
-                    &seen_trade_ids,
-                    &task_spawner,
-                );
             }
 
             log::debug!("Data dispatch loop ended");
@@ -818,26 +875,27 @@ impl BinanceSpotExecutionClient {
         self.ws_user_data_dispatch = Some(dispatch);
 
         let keepalive_http = self.http_client.clone();
-        let keepalive_key = listen_key.clone();
+        let keepalive_key = Arc::clone(&self.listen_key);
 
-        if let Err(e) = self.session_tasks.spawn(async move {
+        self.session_tasks.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
             interval.tick().await;
 
             loop {
                 interval.tick().await;
+                let Some(key) = keepalive_key.read().clone() else {
+                    continue;
+                };
 
                 if let Err(e) = keepalive_http
                     .inner()
-                    .extend_listen_key(keepalive_key.expose_secret())
+                    .extend_listen_key(key.expose_secret())
                     .await
                 {
                     log::warn!("Binance US listen key keepalive failed: {e}");
                 }
             }
-        }) {
-            return Err(e.into());
-        }
+        })?;
 
         ws_user_data.mark_user_data_active();
         *self.ws_user_data_client.lock() = Some(ws_user_data);
@@ -862,7 +920,8 @@ impl BinanceSpotExecutionClient {
             *self.ws_user_data_client.lock() = None;
         }
 
-        if let Some(listen_key) = self.listen_key.clone() {
+        let listen_key = self.listen_key.read().clone();
+        if let Some(listen_key) = listen_key {
             match self
                 .http_client
                 .inner()
@@ -870,10 +929,14 @@ impl BinanceSpotExecutionClient {
                 .await
             {
                 Ok(())
-                    if self.listen_key.as_ref().map(SecretString::expose_secret)
+                    if self
+                        .listen_key
+                        .read()
+                        .as_ref()
+                        .map(SecretString::expose_secret)
                         == Some(listen_key.expose_secret()) =>
                 {
-                    self.listen_key = None;
+                    *self.listen_key.write() = None;
                 }
                 Ok(()) => {}
                 Err(e) => self
@@ -1060,6 +1123,23 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                         .session_tasks
                         .spawner()
                         .context("Binance Spot session task admission is closed")?;
+                    let (recovery_tx, recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let recovery = SpotUserStreamRecovery {
+                        http_client: self.http_client.clone(),
+                        emitter: self.emitter.clone(),
+                        account_id,
+                        clock,
+                        instrument_provider: self.config.instrument_provider.clone(),
+                        dispatch_state: Arc::clone(&dispatch_state),
+                        treat_expired_as_canceled,
+                        resume: SpotUserStreamResume::WsApi {
+                            client: ws_trading.clone(),
+                        },
+                    };
+
+                    self.session_tasks.spawn(async move {
+                        run_spot_user_stream_recovery(recovery, recovery_rx).await;
+                    })?;
 
                     let future = async move {
                         let mut resubscribing = false;
@@ -1067,6 +1147,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                         loop {
                             match ws_trading_clone.recv().await {
                                 Some(msg) => {
+                                    signal_user_stream_recovery(&msg, &recovery_tx);
                                     match &msg {
                                         BinanceSpotWsTradingMessage::Reconnected => {
                                             ws_trading_clone.mark_user_data_inactive();
@@ -2829,6 +2910,16 @@ fn dispatch_ws_trading_message(
         BinanceSpotWsTradingMessage::ServerShutdown { event_time } => {
             log::warn!(
                 "WS trading API server shutdown notice (event_time={event_time}); reconnect expected within ~10 minutes"
+            );
+        }
+        BinanceSpotWsTradingMessage::ListenKeyExpired { event_time } => {
+            log::warn!(
+                "Binance Spot listen key expired at {event_time}; user stream recovery handles resumption"
+            );
+        }
+        BinanceSpotWsTradingMessage::EventStreamTerminated { event_time } => {
+            log::warn!(
+                "Binance Spot user data stream terminated at {event_time}; user stream recovery handles resumption"
             );
         }
         BinanceSpotWsTradingMessage::Error(err) => {
