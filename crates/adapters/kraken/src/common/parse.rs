@@ -1004,7 +1004,8 @@ pub fn parse_fill_report(
 ///
 /// # Errors
 ///
-/// Returns an error if order ID, quantities, or prices cannot be parsed.
+/// Returns an error if order ID, quantities, or prices cannot be parsed, or if the
+/// venue order type is unknown.
 pub fn parse_futures_order_status_report(
     order: &FuturesOpenOrder,
     instrument: &InstrumentAny,
@@ -1016,7 +1017,7 @@ pub fn parse_futures_order_status_report(
     let venue_order_id = parse_venue_order_id(&order.order_id, "futures open order")?;
 
     let order_side = OrderSide::from(order.side).into();
-    let order_type: OrderType = order.order_type.into();
+    let order_type = OrderType::try_from(order.order_type)?;
     let order_type = if order_type == OrderType::MarketIfTouched && order.limit_price.is_some() {
         OrderType::LimitIfTouched
     } else {
@@ -1089,7 +1090,8 @@ pub fn parse_futures_order_status_report(
 ///
 /// # Errors
 ///
-/// Returns an error if order ID, quantities, or prices cannot be parsed.
+/// Returns an error if order ID, quantities, or prices cannot be parsed, or if the
+/// venue order type is unknown.
 pub fn parse_futures_order_event_status_report(
     event: &FuturesOrderEvent,
     event_type: Option<KrakenFuturesOrderEventType>,
@@ -1101,7 +1103,7 @@ pub fn parse_futures_order_event_status_report(
     let venue_order_id = parse_venue_order_id(&event.order_id, "futures order event")?;
 
     let order_side = OrderSide::from(event.side).into();
-    let order_type: OrderType = event.order_type.into();
+    let order_type = OrderType::try_from(event.order_type)?;
     let order_type = if order_type == OrderType::MarketIfTouched && event.limit_price.is_some() {
         OrderType::LimitIfTouched
     } else {

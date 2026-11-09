@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use dashmap::{DashMap, mapref::entry::Entry};
 use indexmap::IndexMap;
 use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
@@ -42,6 +42,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use parking_lot::Mutex;
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 pub(crate) const DEDUP_CAPACITY: usize = 10_000;
@@ -129,6 +130,8 @@ pub struct WsDispatchState {
     /// Cancel-replace request IDs mapped to their `cancelNewClientOrderId`.
     pub cancel_replace_request_ids: DashMap<String, String>,
     cancel_replace_outcomes: Mutex<FifoCacheMap<String, CancelReplaceOutcome, DEDUP_CAPACITY>>,
+    /// Last full spot balance snapshot, keyed by asset as `(free, locked)`.
+    spot_balances: Mutex<AHashMap<Ustr, (Decimal, Decimal)>>,
 }
 
 impl Default for WsDispatchState {
@@ -148,7 +151,65 @@ impl Default for WsDispatchState {
             filled_orders: Mutex::new(FifoCache::new()),
             cancel_replace_request_ids: DashMap::new(),
             cancel_replace_outcomes: Mutex::new(FifoCacheMap::new()),
+            spot_balances: Mutex::new(AHashMap::new()),
         }
+    }
+}
+
+impl WsDispatchState {
+    /// Replaces the cached spot balances with a full account-position snapshot.
+    pub(crate) fn remember_spot_balances(
+        &self,
+        balances: impl IntoIterator<Item = (Ustr, Decimal, Decimal)>,
+    ) {
+        let mut cached = self.spot_balances.lock();
+        cached.clear();
+        cached.extend(
+            balances
+                .into_iter()
+                .map(|(asset, free, locked)| (asset, (free, locked))),
+        );
+    }
+
+    /// Applies a locked-quantity delta to one cached asset.
+    ///
+    /// Free decreases by the same delta so the total is unchanged. Returns `Ok(None)` when
+    /// the asset has not been seen in a full snapshot. A negative free or locked balance,
+    /// or a decimal overflow, leaves the cache unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delta would overflow or make free or locked negative.
+    pub(crate) fn apply_spot_locked_delta(
+        &self,
+        asset: Ustr,
+        delta: Decimal,
+    ) -> anyhow::Result<Option<Vec<(Ustr, Decimal, Decimal)>>> {
+        let mut cached = self.spot_balances.lock();
+        let Some((free, locked)) = cached.get(&asset).copied() else {
+            return Ok(None);
+        };
+
+        let locked = locked.checked_add(delta).ok_or_else(|| {
+            anyhow::anyhow!("decimal overflow adding locked delta {delta} for {asset}")
+        })?;
+        let free = free.checked_sub(delta).ok_or_else(|| {
+            anyhow::anyhow!("decimal overflow subtracting locked delta {delta} for {asset}")
+        })?;
+
+        if free.is_sign_negative() || locked.is_sign_negative() {
+            anyhow::bail!(
+                "external lock update for {asset} would make free {free} or locked {locked} negative"
+            );
+        }
+
+        cached.insert(asset, (free, locked));
+        Ok(Some(
+            cached
+                .iter()
+                .map(|(asset, (free, locked))| (*asset, *free, *locked))
+                .collect(),
+        ))
     }
 }
 

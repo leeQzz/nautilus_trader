@@ -54,7 +54,7 @@ use nautilus_model::{
     },
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
-    orders::{LIMIT_ORDER_TYPES, Order, OrderAny, STOP_ORDER_TYPES},
+    orders::{LIMIT_ORDER_TYPES, Order, OrderAny, STOP_ORDER_TYPES, quantity_would_reduce_only},
     types::{Currency, Money, Price, Quantity, quantity::QuantityRaw},
 };
 use nautilus_portfolio::Portfolio;
@@ -610,7 +610,24 @@ impl RiskEngine {
             };
 
             if let Some((pos_side, pos_quantity)) = position_exists {
-                if !order.would_reduce_only(pos_side, pos_quantity) {
+                let reduces = if Self::quote_reduce_needs_conversion(&order, pos_side) {
+                    match self.converted_reduce_quantities(&order) {
+                        Ok((leaves, _)) => quantity_would_reduce_only(
+                            order.order_side(),
+                            leaves,
+                            pos_side,
+                            pos_quantity,
+                        ),
+                        Err(reason) => {
+                            self.deny_command(TradingCommand::SubmitOrder(command), &reason);
+                            return;
+                        }
+                    }
+                } else {
+                    order.would_reduce_only(pos_side, pos_quantity)
+                };
+
+                if !reduces {
                     self.deny_command(
                         TradingCommand::SubmitOrder(command),
                         &OrderDeniedReason::ReduceOnlyWouldIncreasePosition { position_id }
@@ -717,15 +734,117 @@ impl RiskEngine {
             && order.quantity().is_positive()
     }
 
-    fn is_reducing_submission(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
-        order.is_reduce_only()
+    fn is_reducing_submission(
+        &self,
+        command: &SubmitOrder,
+        order: &OrderAny,
+    ) -> Result<bool, String> {
+        if !(order.is_reduce_only()
             && order.quantity().is_positive()
-            && command.instrument_id == order.instrument_id()
-            && self
-                .identified_open_position(command, order)
-                .is_some_and(|(side, quantity)| {
-                    order.would_reduce_only(side, quantity) && order.quantity() <= quantity
+            && command.instrument_id == order.instrument_id())
+        {
+            return Ok(false);
+        }
+
+        let Some((side, position_qty)) = self.identified_open_position(command, order) else {
+            return Ok(false);
+        };
+
+        let (leaves, quantity) = self.converted_reduce_quantities(order)?;
+        Ok(
+            quantity_would_reduce_only(order.order_side(), leaves, side, position_qty)
+                && quantity <= position_qty,
+        )
+    }
+
+    fn quote_reduce_needs_conversion(order: &OrderAny, position_side: PositionSide) -> bool {
+        order.is_quote_quantity()
+            && matches!(
+                (order.order_side(), position_side),
+                (OrderSide::Buy, PositionSide::Short) | (OrderSide::Sell, PositionSide::Long)
+            )
+    }
+
+    /// Converts quote quantity with the same price and inverse rules as `order_risk_quantity`.
+    fn converted_reduce_quantities(
+        &self,
+        order: &OrderAny,
+    ) -> Result<(Quantity, Quantity), String> {
+        let leaves = order.leaves_qty();
+        let quantity = order.quantity();
+        if !order.is_quote_quantity() {
+            return Ok((leaves, quantity));
+        }
+
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&order.instrument_id()) else {
+                return Err(OrderDeniedReason::InstrumentNotFound {
+                    instrument_id: order.instrument_id(),
+                }
+                .to_string());
+            };
+            instrument.clone()
+        };
+
+        if instrument.is_inverse() {
+            return Ok((leaves, quantity));
+        }
+
+        let price = self.reduce_only_reference_price(order)?;
+        let price = self.quote_risk_price(order, instrument.id(), price);
+        let convert = |quantity| {
+            instrument
+                .order_base_quantity(true, quantity, price)
+                .map_err(|e| {
+                    OrderDeniedReason::QuantityConversionFailed {
+                        detail: e.to_string(),
+                    }
+                    .to_string()
                 })
+        };
+        Ok((convert(leaves)?, convert(quantity)?))
+    }
+
+    fn reduce_only_reference_price(&self, order: &OrderAny) -> Result<Price, String> {
+        let price = match order {
+            OrderAny::MarketToLimit(_) if order.price().is_some() => order.price(),
+            OrderAny::Market(_) | OrderAny::MarketToLimit(_) => {
+                self.market_order_price(order.instrument_id(), order.order_side())
+            }
+            OrderAny::StopMarket(_) | OrderAny::MarketIfTouched(_) => order.trigger_price(),
+            OrderAny::TrailingStopMarket(_) | OrderAny::TrailingStopLimit(_) => {
+                order.price().or_else(|| order.trigger_price())
+            }
+            _ => order.price(),
+        };
+
+        price.ok_or_else(|| {
+            OrderDeniedReason::MarketPriceUnavailable {
+                order_type: order.order_type(),
+                instrument_id: order.instrument_id(),
+            }
+            .to_string()
+        })
+    }
+
+    fn quote_risk_price(
+        &self,
+        order: &OrderAny,
+        instrument_id: InstrumentId,
+        price: Price,
+    ) -> Price {
+        if !matches!(order, OrderAny::Limit(_) | OrderAny::StopLimit(_)) {
+            return price;
+        }
+
+        self.cache
+            .borrow()
+            .quote(&instrument_id)
+            .map_or(price, |quote| match order.order_side() {
+                OrderSide::Buy => price.min(quote.ask_price),
+                OrderSide::Sell => price.max(quote.bid_price),
+            })
     }
 
     fn reduces_identified_open_position(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
@@ -1557,20 +1676,10 @@ impl RiskEngine {
             return Ok(quantity);
         }
 
-        let effective_price = if matches!(order, OrderAny::Limit(_) | OrderAny::StopLimit(_)) {
-            self.cache
-                .borrow()
-                .quote(&instrument.id())
-                .map_or(price, |quote| match order.order_side() {
-                    OrderSide::Buy => price.min(quote.ask_price),
-                    OrderSide::Sell => price.max(quote.bid_price),
-                })
-        } else {
-            price
-        };
+        let effective_price = self.quote_risk_price(order, instrument.id(), price);
 
         instrument
-            .try_calculate_base_quantity(quantity, effective_price)
+            .order_base_quantity(true, quantity, effective_price)
             .map_err(|e| {
                 check.reject(
                     self,
@@ -1966,19 +2075,23 @@ impl RiskEngine {
                         return;
                     };
 
-                    if self.is_reducing_submission(&submit_order, &order) {
-                        self.record_reservations(reservations);
-                        self.throttler_submit
-                            .send(TradingCommand::SubmitOrder(submit_order));
-                    } else {
-                        self.deny_order(
-                            &order,
-                            &OrderDeniedReason::TradingStateReducing {
-                                order_side: order.order_side(),
-                                instrument_id: order.instrument_id(),
-                            }
-                            .to_string(),
-                        );
+                    match self.is_reducing_submission(&submit_order, &order) {
+                        Ok(true) => {
+                            self.record_reservations(reservations);
+                            self.throttler_submit
+                                .send(TradingCommand::SubmitOrder(submit_order));
+                        }
+                        Ok(false) => {
+                            self.deny_order(
+                                &order,
+                                &OrderDeniedReason::TradingStateReducing {
+                                    order_side: order.order_side(),
+                                    instrument_id: order.instrument_id(),
+                                }
+                                .to_string(),
+                            );
+                        }
+                        Err(reason) => self.deny_order(&order, &reason),
                     }
                 }
                 TradingCommand::SubmitOrderList(submit_order_list) => {

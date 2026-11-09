@@ -228,10 +228,18 @@ impl Account for CashAccount {
                 quantity,
                 -price,
                 use_quote_for_inverse,
+                false,
             );
         }
 
-        self.base_calculate_balance_locked(instrument, side, quantity, price, use_quote_for_inverse)
+        self.base_calculate_balance_locked(
+            instrument,
+            side,
+            quantity,
+            price,
+            use_quote_for_inverse,
+            false,
+        )
     }
 
     fn calculate_pnls(

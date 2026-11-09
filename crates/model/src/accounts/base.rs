@@ -306,7 +306,18 @@ impl BaseAccount {
         quantity: Quantity,
         price: Price,
         use_quote_for_inverse: Option<bool>,
+        is_quote_quantity: bool,
     ) -> anyhow::Result<Money> {
+        if is_quote_quantity && !instrument.is_inverse() {
+            return self.quote_quantity_balance_locked(
+                instrument,
+                side,
+                quantity,
+                price,
+                use_quote_for_inverse,
+            );
+        }
+
         match side {
             // A buy at a negative price settles as a credit rather than a debit, so it
             // reserves nothing. Clamping per order rather than after aggregation keeps a
@@ -321,6 +332,42 @@ impl BaseAccount {
                 Some(currency) => Ok(money_from_qty(quantity, currency)?),
                 None => Ok(Money::from_raw_checked(0, instrument.quote_currency())?),
             },
+        }
+    }
+
+    /// Locks a linear quote order without treating `quantity` as base size.
+    ///
+    /// A buy locks the quote notional directly. A sell converts to base quantity first,
+    /// using the absolute price so a negative-price disposal still has a positive divisor.
+    fn quote_quantity_balance_locked(
+        &self,
+        instrument: &InstrumentAny,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        match side {
+            OrderSide::Buy => {
+                if price.is_negative() {
+                    return Ok(Money::from_raw_checked(0, instrument.cost_currency())?);
+                }
+
+                let notional = money_from_qty(quantity, instrument.cost_currency())?;
+                Ok(notional.max(Money::zero(notional.currency)))
+            }
+            OrderSide::Sell => {
+                let conversion_price = if price.is_negative() { -price } else { price };
+                let base_qty = instrument.order_base_quantity(true, quantity, conversion_price)?;
+                self.base_calculate_balance_locked(
+                    instrument,
+                    side,
+                    base_qty,
+                    price,
+                    use_quote_for_inverse,
+                    false,
+                )
+            }
         }
     }
 

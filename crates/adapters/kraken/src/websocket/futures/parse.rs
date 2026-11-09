@@ -250,7 +250,7 @@ pub fn parse_futures_ws_order_status_report(
 ) -> anyhow::Result<OrderStatusReport> {
     let venue_order_id = parse_venue_order_id(&order.order_id, "futures order delta")?;
     let order_side = parse_ws_direction(order.direction);
-    let order_type = OrderType::from(order.order_type);
+    let order_type = OrderType::try_from(order.order_type)?;
     let order_type = if order_type == OrderType::MarketIfTouched && order.limit_price.is_some() {
         OrderType::LimitIfTouched
     } else {

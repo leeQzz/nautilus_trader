@@ -16,7 +16,8 @@
 //! SBE decoders for Binance Spot user data stream events.
 //!
 //! Decodes schema 3:5 templates 601 (BalanceUpdateEvent), 603 (ExecutionReportEvent),
-//! 606 (ListStatusEvent), and 607 (OutboundAccountPositionEvent) into venue structs.
+//! 604 (ExternalLockUpdateEvent), 606 (ListStatusEvent), and 607
+//! (OutboundAccountPositionEvent) into venue structs.
 //! Execution reports and account positions convert to Nautilus types in [`super::parse`].
 //! The Spot execution client dispatches list lifecycle updates directly.
 
@@ -27,8 +28,8 @@ use ustr::Ustr;
 
 use super::user_data::{
     BinanceSpotAccountPositionMsg, BinanceSpotBalanceEntry, BinanceSpotBalanceUpdateMsg,
-    BinanceSpotExecutionReport, BinanceSpotExecutionType, BinanceSpotListOrder,
-    BinanceSpotListStatus,
+    BinanceSpotExecutionReport, BinanceSpotExecutionType, BinanceSpotExternalLockUpdateMsg,
+    BinanceSpotListOrder, BinanceSpotListStatus,
 };
 use crate::{
     common::{
@@ -39,9 +40,10 @@ use crate::{
     },
     spot::sbe::spot::{
         ReadBuf, balance_update_event_codec, bool_enum, contingency_type,
-        execution_report_event_codec, execution_type, expiry_reason, group_size_encoding_codec,
-        list_order_status, list_status_event_codec, list_status_type, message_header_codec,
-        order_side, order_status, order_type, outbound_account_position_event_codec, time_in_force,
+        execution_report_event_codec, execution_type, expiry_reason,
+        external_lock_update_event_codec, group_size_encoding_codec, list_order_status,
+        list_status_event_codec, list_status_type, message_header_codec, order_side, order_status,
+        order_type, outbound_account_position_event_codec, time_in_force,
     },
 };
 
@@ -49,6 +51,7 @@ const HEADER_LEN: usize = message_header_codec::ENCODED_LENGTH;
 const ACCOUNT_POSITION_BLOCK_LENGTH_V0: usize = 16;
 const ACCOUNT_POSITION_BALANCE_BLOCK_LENGTH: usize = 17;
 const BALANCE_UPDATE_BLOCK_LENGTH_V0: usize = 25;
+const EXTERNAL_LOCK_UPDATE_BLOCK_LENGTH_V0: usize = 25;
 
 // Historical block lengths are not exposed by the generated codec
 const EXECUTION_REPORT_BLOCK_LENGTH_V0: usize = 268;
@@ -656,6 +659,96 @@ pub fn decode_balance_update(data: &[u8]) -> anyhow::Result<BinanceSpotBalanceUp
         event_time: us_to_ms(event_time_us),
         asset: Ustr::from(&asset),
         delta: mantissa_to_decimal_string(free_qty_delta, qty_exponent)?,
+        clear_time: us_to_ms(clear_time_us),
+    })
+}
+
+/// Decodes an SBE ExternalLockUpdateEvent (template 604).
+///
+/// The input buffer must include the 8-byte SBE message header. `delta` is the locked
+/// quantity change.
+///
+/// # Errors
+///
+/// Returns an error if the buffer, template, schema, block length, exponent, locked
+/// delta, or asset framing is invalid.
+pub fn decode_external_lock_update(
+    data: &[u8],
+) -> anyhow::Result<BinanceSpotExternalLockUpdateMsg> {
+    if data.len() < HEADER_LEN {
+        anyhow::bail!(
+            "Buffer too short for SBE header: expected {HEADER_LEN}, was {}",
+            data.len()
+        );
+    }
+
+    let buf = ReadBuf::new(data);
+    let block_length = buf.get_u16_at(0);
+    let template_id = buf.get_u16_at(2);
+    let schema_id = buf.get_u16_at(4);
+    let version = buf.get_u16_at(6);
+
+    if template_id != external_lock_update_event_codec::SBE_TEMPLATE_ID {
+        anyhow::bail!(
+            "Wrong template ID: expected {}, received {template_id}",
+            external_lock_update_event_codec::SBE_TEMPLATE_ID
+        );
+    }
+
+    if schema_id != crate::spot::sbe::spot::SBE_SCHEMA_ID {
+        anyhow::bail!(
+            "Wrong schema ID: expected {}, received {schema_id}",
+            crate::spot::sbe::spot::SBE_SCHEMA_ID
+        );
+    }
+
+    let min_block_len = if version == 0 {
+        EXTERNAL_LOCK_UPDATE_BLOCK_LENGTH_V0
+    } else {
+        usize::from(external_lock_update_event_codec::SBE_BLOCK_LENGTH)
+    };
+
+    if usize::from(block_length) < min_block_len {
+        anyhow::bail!(
+            "SBE external lock update block length too short: expected at least {min_block_len}, was {block_length}"
+        );
+    }
+
+    let min_len = HEADER_LEN + usize::from(block_length);
+    if data.len() < min_len {
+        anyhow::bail!(
+            "Buffer too short for fixed block: expected {min_len}, was {}",
+            data.len()
+        );
+    }
+
+    validate_asset(data, min_len)?;
+
+    let mut dec = external_lock_update_event_codec::ExternalLockUpdateEventDecoder::default().wrap(
+        buf,
+        HEADER_LEN,
+        block_length,
+        version,
+    );
+
+    let event_time_us = dec.event_time();
+    let clear_time_us = dec.clear_time();
+    let qty_exponent = dec.qty_exponent();
+    let locked_qty_delta = dec.locked_qty_delta();
+    if locked_qty_delta == i64::MIN {
+        anyhow::bail!("Invalid SBE locked quantity delta: value is null");
+    }
+
+    let asset = {
+        let coords = dec.asset_decoder();
+        String::from_utf8_lossy(dec.asset_slice(coords)).into_owned()
+    };
+
+    Ok(BinanceSpotExternalLockUpdateMsg {
+        event_type: "externalLockUpdate".to_string(),
+        event_time: us_to_ms(event_time_us),
+        asset: Ustr::from(&asset),
+        delta: mantissa_to_decimal_string(locked_qty_delta, qty_exponent)?,
         clear_time: us_to_ms(clear_time_us),
     })
 }
@@ -2149,6 +2242,58 @@ mod tests {
         assert_eq!(msg.asset, "BTC");
         assert_eq!(msg.delta, "100.00000000");
         assert_eq!(msg.clear_time, 1709654400000);
+    }
+
+    fn encode_external_lock_update(
+        event_time_us: i64,
+        clear_time_us: i64,
+        qty_exponent: i8,
+        locked_qty_delta: i64,
+        asset: &str,
+    ) -> Vec<u8> {
+        let total = 8 + 27 + 1 + asset.len();
+        let mut buf_vec = vec![0u8; total];
+        let buf = WriteBuf::new(buf_vec.as_mut_slice());
+        let enc = external_lock_update_event_codec::ExternalLockUpdateEventEncoder::default()
+            .wrap(buf, HEADER_LEN);
+        let mut header = enc.header(0);
+        let mut enc = header.parent().unwrap();
+
+        enc.event_time(event_time_us);
+        enc.clear_time(clear_time_us);
+        enc.qty_exponent(qty_exponent);
+        enc.locked_qty_delta(locked_qty_delta);
+        enc.subscription_id(0xFFFF);
+        enc.asset(asset);
+
+        buf_vec
+    }
+
+    #[rstest]
+    fn test_decode_external_lock_update() {
+        let data = encode_external_lock_update(
+            1_709_654_400_000_000,
+            1_709_654_400_000_000,
+            -8,
+            300_000_000,
+            "BTC",
+        );
+
+        let msg = decode_external_lock_update(&data).unwrap();
+
+        assert_eq!(msg.event_type, "externalLockUpdate");
+        assert_eq!(msg.event_time, 1_709_654_400_000);
+        assert_eq!(msg.asset, "BTC");
+        assert_eq!(msg.delta, "3.00000000");
+        assert_eq!(msg.clear_time, 1_709_654_400_000);
+    }
+
+    #[rstest]
+    fn test_decode_external_lock_update_rejects_short_buffer() {
+        let mut data = vec![0u8; HEADER_LEN];
+        data[2..4].copy_from_slice(&604_u16.to_le_bytes());
+
+        assert!(decode_external_lock_update(&data).is_err());
     }
 
     #[rstest]

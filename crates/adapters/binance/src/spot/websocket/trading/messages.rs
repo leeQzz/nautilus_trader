@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use super::user_data::{
     BinanceSpotAccountPositionMsg, BinanceSpotBalanceUpdateMsg, BinanceSpotExecutionReport,
-    BinanceSpotListStatus,
+    BinanceSpotExternalLockUpdateMsg, BinanceSpotListStatus,
 };
 use crate::spot::http::{
     models::{
@@ -181,6 +181,10 @@ pub enum BinanceSpotWsTradingMessage {
     AccountPosition(BinanceSpotAccountPositionMsg),
     /// Balance update from user data stream.
     BalanceUpdate(BinanceSpotBalanceUpdateMsg),
+    /// External lock update from the user data stream.
+    ExternalLockUpdate(BinanceSpotExternalLockUpdateMsg),
+    /// A balance payload could not be decoded. This is not a session-setup failure.
+    BalanceError(String),
     /// Server shutdown notice (sent ~10 minutes before disconnection).
     ServerShutdown {
         /// Event time in milliseconds.

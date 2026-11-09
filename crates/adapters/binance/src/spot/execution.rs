@@ -73,7 +73,10 @@ use super::websocket::trading::{
         parse_spot_account_position, parse_spot_exec_report_to_fill,
         parse_spot_exec_report_to_order_status,
     },
-    user_data::{BinanceSpotExecutionReport, BinanceSpotExecutionType, BinanceSpotListStatus},
+    user_data::{
+        BinanceSpotAccountPositionMsg, BinanceSpotBalanceEntry, BinanceSpotExecutionReport,
+        BinanceSpotExecutionType, BinanceSpotExternalLockUpdateMsg, BinanceSpotListStatus,
+    },
 };
 use crate::{
     common::{
@@ -2481,6 +2484,75 @@ async fn wait_for_ws_setup_response(
     result.map_err(|_| anyhow::anyhow!(timeout_message))?
 }
 
+fn dispatch_external_lock_update(
+    update: &BinanceSpotExternalLockUpdateMsg,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceSpotHttpClient,
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+    task_spawner: &TaskSpawner,
+) {
+    let delta = match update.delta.parse::<Decimal>() {
+        Ok(delta) => delta,
+        Err(e) => {
+            log::error!(
+                "Ignoring external lock update for {}: invalid delta {}: {e}",
+                update.asset,
+                update.delta
+            );
+            return;
+        }
+    };
+
+    match dispatch_state.apply_spot_locked_delta(update.asset, delta) {
+        Ok(Some(balances)) => {
+            let position = BinanceSpotAccountPositionMsg {
+                event_type: "outboundAccountPosition".to_string(),
+                event_time: update.event_time,
+                last_update_time: update.clear_time,
+                balances: balances
+                    .into_iter()
+                    .map(|(asset, free, locked)| BinanceSpotBalanceEntry {
+                        asset,
+                        free,
+                        locked,
+                    })
+                    .collect(),
+            };
+
+            match parse_spot_account_position(&position, account_id, clock.get_time_ns()) {
+                Ok(state) => emitter.send_account_state(state),
+                Err(e) => log::error!(
+                    "Ignoring external lock update to avoid partial account state: {e:#}"
+                ),
+            }
+        }
+        Ok(None) => {
+            log::debug!(
+                "External lock update for unknown asset {}, refreshing account",
+                update.asset
+            );
+            let http_client = http_client.clone();
+            let emitter = emitter.clone();
+
+            if let Err(e) = task_spawner.spawn(async move {
+                match http_client.request_account_state(account_id).await {
+                    Ok(state) => emitter.send_account_state(state),
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to refresh account state after external lock update: {e}"
+                        );
+                    }
+                }
+            }) {
+                log::warn!("Skipping Binance Spot balance refresh after shutdown began: {e}");
+            }
+        }
+        Err(e) => log::error!("Ignoring external lock update for {}: {e:#}", update.asset),
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 fn dispatch_ws_trading_message(
     msg: BinanceSpotWsTradingMessage,
@@ -2786,11 +2858,33 @@ fn dispatch_ws_trading_message(
         BinanceSpotWsTradingMessage::AccountPosition(position) => {
             let ts_init = clock.get_time_ns();
             match parse_spot_account_position(&position, account_id, ts_init) {
-                Ok(state) => emitter.send_account_state(state),
+                Ok(state) => {
+                    dispatch_state.remember_spot_balances(
+                        position
+                            .balances
+                            .iter()
+                            .map(|balance| (balance.asset, balance.free, balance.locked)),
+                    );
+                    emitter.send_account_state(state);
+                }
                 Err(e) => log::error!(
                     "Ignoring invalid spot account position to avoid partial account state: {e:#}"
                 ),
             }
+        }
+        BinanceSpotWsTradingMessage::ExternalLockUpdate(update) => {
+            dispatch_external_lock_update(
+                &update,
+                emitter,
+                http_client,
+                account_id,
+                clock,
+                dispatch_state,
+                task_spawner,
+            );
+        }
+        BinanceSpotWsTradingMessage::BalanceError(err) => {
+            log::error!("WS trading API balance error: {err}");
         }
         BinanceSpotWsTradingMessage::BalanceUpdate(update) => {
             log::debug!(
@@ -4845,6 +4939,123 @@ mod tests {
         let mut rx = dispatch_account_position(position);
 
         assert!(rx.try_recv().is_err());
+    }
+
+    fn dispatch_with_state(
+        message: BinanceSpotWsTradingMessage,
+        dispatch_state: &WsDispatchState,
+        emitter: &ExecutionEventEmitter,
+        http_client: &BinanceSpotHttpClient,
+        clock: &'static AtomicTime,
+        ws_setup_error_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+        task_spawner: &TaskSpawner,
+    ) {
+        let ws_authenticated = tokio::sync::Notify::new();
+        let ws_user_data_subscribed = tokio::sync::Notify::new();
+        let seen_trade_ids = Arc::new(Mutex::new(FifoCache::new()));
+        dispatch_ws_trading_message(
+            message,
+            emitter,
+            http_client,
+            AccountId::from("BINANCE-001"),
+            false,
+            clock,
+            dispatch_state,
+            &ws_authenticated,
+            &ws_user_data_subscribed,
+            ws_setup_error_tx,
+            &seen_trade_ids,
+            task_spawner,
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_external_lock_update_applies_locked_delta() {
+        let tasks = TaskGroup::new();
+        let task_spawner = tasks.spawner().expect("task spawner");
+        let clock = get_atomic_clock_realtime();
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = WsDispatchState::default();
+        let (ws_setup_error_tx, mut ws_setup_error_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        dispatch_with_state(
+            BinanceSpotWsTradingMessage::AccountPosition(account_position(vec![
+                BinanceSpotBalanceEntry {
+                    asset: Ustr::from("BTC"),
+                    free: Decimal::from(5),
+                    locked: Decimal::from(1),
+                },
+                BinanceSpotBalanceEntry {
+                    asset: Ustr::from("ETH"),
+                    free: Decimal::from(10),
+                    locked: Decimal::ZERO,
+                },
+            ])),
+            &dispatch_state,
+            &emitter,
+            &http_client,
+            clock,
+            &ws_setup_error_tx,
+            &task_spawner,
+        );
+        rx.try_recv().expect("initial account state");
+
+        dispatch_with_state(
+            BinanceSpotWsTradingMessage::ExternalLockUpdate(BinanceSpotExternalLockUpdateMsg {
+                event_type: "externalLockUpdate".to_string(),
+                event_time: 1_700_000_000_100,
+                asset: Ustr::from("BTC"),
+                delta: "0.5".to_string(),
+                clear_time: 1_700_000_000_100,
+            }),
+            &dispatch_state,
+            &emitter,
+            &http_client,
+            clock,
+            &ws_setup_error_tx,
+            &task_spawner,
+        );
+
+        match rx.try_recv().expect("updated account state") {
+            ExecutionEvent::Account(state) => {
+                let btc = state
+                    .balances
+                    .iter()
+                    .find(|balance| balance.currency.code.as_str() == "BTC")
+                    .expect("BTC balance");
+                assert_eq!(btc.locked.as_decimal(), "1.5".parse::<Decimal>().unwrap());
+                assert_eq!(btc.free.as_decimal(), "4.5".parse::<Decimal>().unwrap());
+                assert_eq!(btc.total.as_decimal(), Decimal::from(6));
+                assert_eq!(state.balances.len(), 2);
+            }
+            other => panic!("Expected account state, was {other:?}"),
+        }
+        assert!(ws_setup_error_rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_dispatch_balance_error_does_not_signal_session_setup() {
+        let tasks = TaskGroup::new();
+        let task_spawner = tasks.spawner().expect("task spawner");
+        let clock = get_atomic_clock_realtime();
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = WsDispatchState::default();
+        let (ws_setup_error_tx, mut ws_setup_error_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        dispatch_with_state(
+            BinanceSpotWsTradingMessage::BalanceError("invalid external lock update".to_string()),
+            &dispatch_state,
+            &emitter,
+            &http_client,
+            clock,
+            &ws_setup_error_tx,
+            &task_spawner,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(ws_setup_error_rx.try_recv().is_err());
     }
 
     fn create_test_emitter(

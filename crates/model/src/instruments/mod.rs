@@ -246,6 +246,29 @@ fn is_usd_equivalent_currency(currency: Currency) -> bool {
     )
 }
 
+/// Quote quantity could not be converted into the instrument's base quantity.
+#[derive(Debug)]
+pub struct QuoteQuantityConversionError {
+    detail: String,
+}
+
+impl QuoteQuantityConversionError {
+    /// Creates an error whose message is `detail`.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl Display for QuoteQuantityConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for QuoteQuantityConversionError {}
+
 #[enum_dispatch]
 pub trait Instrument: Any + Send {
     fn tick_scheme(&self) -> Option<Ustr> {
@@ -613,6 +636,29 @@ pub trait Instrument: Any + Send {
     fn calculate_base_quantity(&self, quantity: Quantity, last_price: Price) -> Quantity {
         self.try_calculate_base_quantity(quantity, last_price)
             .unwrap()
+    }
+
+    /// Returns `quantity` in base units.
+    ///
+    /// Quote quantity on a linear instrument is divided by `price`. Inverse contracts and
+    /// base-denominated orders keep `quantity` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a linear quote quantity cannot be converted at `price`,
+    /// including a zero price.
+    fn order_base_quantity(
+        &self,
+        is_quote_quantity: bool,
+        quantity: Quantity,
+        price: Price,
+    ) -> anyhow::Result<Quantity> {
+        if !is_quote_quantity || self.is_inverse() {
+            return Ok(quantity);
+        }
+
+        self.try_calculate_base_quantity(quantity, price)
+            .map_err(|e| anyhow::Error::new(QuoteQuantityConversionError::new(e.to_string())))
     }
 
     /// Calculates the notional value for the given quantity and price.

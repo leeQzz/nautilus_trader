@@ -35,7 +35,7 @@ use nautilus_model::{
         MarketStatus, MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
         RecordFlag, TimeInForce, TrailingOffsetType, TriggerType,
     },
-    events::{OrderEventAny, OrderEventType, OrderReleased},
+    events::{OrderEventAny, OrderEventType, OrderReleased, order::spec::OrderUpdatedSpec},
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     instruments::{
         Instrument, InstrumentAny,
@@ -1545,6 +1545,101 @@ fn test_position_sync_includes_newly_activated_oto_child(#[values(false, true)] 
     assert_eq!(child.quantity(), Quantity::from("2.000"));
     assert_eq!(child.filled_qty(), Quantity::from("0.000"));
     assert_eq!(child.leaves_qty(), Quantity::from("2.000"));
+}
+
+fn test_engine(instrument: InstrumentAny) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let engine = OrderMatchingEngine::new(
+        instrument,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
+        BookType::L2_MBP,
+        OmsType::Hedging,
+        AccountType::Margin,
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache.clone(),
+        Default::default(),
+    );
+    (engine, cache)
+}
+
+#[rstest]
+fn test_process_oto_resize_missing_child_does_not_panic() {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let (mut engine, cache) = test_engine(instrument.clone());
+    let child_id = ClientOrderId::from("OTO-MISSING");
+    let parent = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("OTO-PARENT-MISSING"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("10.000"))
+        .price(Price::from("1000.00"))
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(vec![child_id])
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(parent.clone(), None, None, false)
+        .unwrap();
+
+    engine.process_oto_resize(parent.client_order_id(), Quantity::from("10.000"));
+
+    assert!(cache.borrow().order(&child_id).is_none());
+}
+
+#[rstest]
+fn test_process_oto_resize_failed_deferred_update_does_not_panic() {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let (mut engine, cache) = test_engine(instrument.clone());
+    let child_id = ClientOrderId::from("OTO-CHILD-BAD-UPDATE");
+    let parent = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("OTO-PARENT-BAD-UPDATE"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("10.000"))
+        .price(Price::from("1000.00"))
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(vec![child_id])
+        .submit(true)
+        .build();
+    let child = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(child_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("10.000"))
+        .price(Price::from("2000.00"))
+        .parent_order_id(parent.client_order_id())
+        .submit(true)
+        .build();
+
+    for order in [parent.clone(), child.clone()] {
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+    }
+    let update = OrderUpdatedSpec::builder()
+        .trader_id(child.trader_id())
+        .strategy_id(child.strategy_id())
+        .instrument_id(child.instrument_id())
+        .client_order_id(child_id)
+        .quantity(child.quantity())
+        .trigger_price(Price::from("2100.00"))
+        .build();
+    engine
+        .orders
+        .pending_updates
+        .borrow_mut()
+        .insert(child_id, vec![update]);
+
+    engine.process_oto_resize(parent.client_order_id(), Quantity::from("10.000"));
+
+    let cached = cache.borrow().order(&child_id).unwrap().clone();
+    assert_eq!(cached.status(), OrderStatus::Submitted);
+    assert_eq!(cached.quantity(), Quantity::from("10.000"));
+    assert!(engine.order_snapshot(child_id).is_none());
 }
 
 fn pending_position_fill(

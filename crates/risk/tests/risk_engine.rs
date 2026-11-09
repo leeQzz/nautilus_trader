@@ -4736,6 +4736,91 @@ fn test_submit_reduce_only_respects_trading_state(
     }
 }
 
+#[rstest]
+#[case::price_above_one_active(TradingState::Active, "1500.000", "2.00", true, None)]
+#[case::price_above_one_reducing(TradingState::Reducing, "1500.000", "2.00", true, None)]
+#[case::price_below_one(
+    TradingState::Active,
+    "800.000",
+    "0.50",
+    false,
+    Some("REDUCE_ONLY_WOULD_INCREASE_POSITION")
+)]
+fn test_submit_quote_quantity_reduce_only_uses_base_quantity(
+    #[case] state: TradingState,
+    #[case] quantity: &str,
+    #[case] price: &str,
+    #[case] should_forward: bool,
+    #[case] denied_prefix: Option<&str>,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+    add_margin_account_for_close_position(&mut simple_cache);
+    let position_id = PositionId::from("P-QUOTE-REDUCE");
+    add_position_for_close_position(
+        &mut simple_cache,
+        &instrument_eth_usdt,
+        Quantity::from("1000.000"),
+        position_id,
+        PositionSide::Long,
+    );
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .client_order_id(ClientOrderId::from("O-QUOTE-REDUCE"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(quantity))
+        .price(Price::from(price))
+        .reduce_only(true)
+        .quote_quantity(true)
+        .build();
+    simple_cache
+        .add_order(
+            order.clone(),
+            Some(position_id),
+            Some(client_id_binance),
+            false,
+        )
+        .unwrap();
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    let command = reducing_command(
+        trader_id,
+        client_id_binance,
+        strategy_id_ema_cross,
+        &order,
+        Some(position_id),
+        risk_engine.clock().borrow().timestamp_ns(),
+    );
+
+    risk_engine.set_trading_state(state);
+    risk_engine.execute(TradingCommand::SubmitOrder(command));
+
+    let process_messages = get_process_order_event_handler_messages(&process_order_event_handler);
+    let execute_messages = get_execute_order_event_handler_messages(&execute_order_event_handler);
+
+    if should_forward {
+        assert!(process_messages.is_empty());
+        assert_eq!(execute_messages.len(), 1);
+    } else {
+        assert_eq!(process_messages.len(), 1);
+        assert!(
+            process_messages[0]
+                .message()
+                .unwrap()
+                .starts_with(denied_prefix.unwrap())
+        );
+        assert!(execute_messages.is_empty());
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InvalidReducingSubmission {
     WrongSide,

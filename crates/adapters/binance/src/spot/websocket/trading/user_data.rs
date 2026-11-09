@@ -257,6 +257,29 @@ pub struct BinanceSpotBalanceUpdateMsg {
     pub clear_time: i64,
 }
 
+/// External lock update (`externalLockUpdate`).
+///
+/// `delta` is the change in locked quantity. A positive delta locks more of the asset
+/// and reduces the free balance by the same amount.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinanceSpotExternalLockUpdateMsg {
+    /// Event type ("externalLockUpdate").
+    #[serde(rename = "e")]
+    pub event_type: String,
+    /// Event time in milliseconds.
+    #[serde(rename = "E")]
+    pub event_time: i64,
+    /// Asset.
+    #[serde(rename = "a")]
+    pub asset: Ustr,
+    /// Locked-quantity delta.
+    #[serde(rename = "d")]
+    pub delta: String,
+    /// Clear time in milliseconds.
+    #[serde(rename = "T")]
+    pub clear_time: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
