@@ -52,7 +52,7 @@ use nautilus_model::{
         OrderDenied, OrderDeniedReason, OrderEventAny, OrderModifyDenied, OrderPriceField,
         OrderUpdated, PositionEvent,
     },
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{LIMIT_ORDER_TYPES, Order, OrderAny, STOP_ORDER_TYPES},
     types::{Currency, Money, Price, Quantity, quantity::QuantityRaw},
@@ -718,29 +718,54 @@ impl RiskEngine {
     }
 
     fn is_reducing_submission(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
+        self.order_reduces_open_position(
+            command.client_id,
+            command.position_id,
+            command.instrument_id,
+            order,
+        )
+    }
+
+    fn reduces_identified_open_position(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
+        self.identified_open_position(
+            command.client_id,
+            command.position_id,
+            command.instrument_id.venue,
+            order,
+        )
+        .is_some_and(|(side, quantity)| order.would_reduce_only(side, quantity))
+    }
+
+    /// Applies the single-order reducing check to one order.
+    ///
+    /// `instrument_id` is the order's own instrument for a list leg, because a
+    /// list command only carries a representative instrument.
+    fn order_reduces_open_position(
+        &self,
+        client_id: Option<ClientId>,
+        position_id: Option<PositionId>,
+        instrument_id: InstrumentId,
+        order: &OrderAny,
+    ) -> bool {
         order.is_reduce_only()
             && order.quantity().is_positive()
-            && command.instrument_id == order.instrument_id()
+            && instrument_id == order.instrument_id()
             && self
-                .identified_open_position(command, order)
+                .identified_open_position(client_id, position_id, instrument_id.venue, order)
                 .is_some_and(|(side, quantity)| {
                     order.would_reduce_only(side, quantity) && order.quantity() <= quantity
                 })
     }
 
-    fn reduces_identified_open_position(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
-        self.identified_open_position(command, order)
-            .is_some_and(|(side, quantity)| order.would_reduce_only(side, quantity))
-    }
-
     fn identified_open_position(
         &self,
-        command: &SubmitOrder,
+        client_id: Option<ClientId>,
+        position_id: Option<PositionId>,
+        venue: Venue,
         order: &OrderAny,
     ) -> Option<(PositionSide, Quantity)> {
-        let position_id = command.position_id?;
-        let account_id =
-            self.order_account_id(order, command.client_id, command.instrument_id.venue);
+        let position_id = position_id?;
+        let account_id = self.order_account_id(order, client_id, venue);
 
         let position = {
             let cache = self.cache.borrow();
@@ -1986,16 +2011,44 @@ impl RiskEngine {
                         &submit_order_list.order_list.client_order_ids,
                         &submit_order_list,
                     );
+                    let order_list_id = submit_order_list.order_list.id;
+                    let complete = !orders.is_empty()
+                        && orders.len() == submit_order_list.order_list.client_order_ids.len();
+                    // An order list is one execution command, so it is forwarded only when
+                    // every leg reduces an open position, and a mixed list is denied in place
+                    // rather than split into individual submissions.
+                    let all_reducing = complete
+                        && orders.iter().all(|order| {
+                            self.order_reduces_open_position(
+                                submit_order_list.client_id,
+                                submit_order_list.position_id,
+                                order.instrument_id(),
+                                order,
+                            )
+                        });
+
+                    if all_reducing {
+                        self.record_reservations(reservations);
+                        self.throttler_submit
+                            .send(TradingCommand::SubmitOrderList(submit_order_list));
+                        return;
+                    }
 
                     for order in &orders {
-                        self.deny_order(
+                        let reason = if self.order_reduces_open_position(
+                            submit_order_list.client_id,
+                            submit_order_list.position_id,
+                            order.instrument_id(),
                             order,
-                            &OrderDeniedReason::TradingStateReducing {
+                        ) {
+                            OrderDeniedReason::OrderListDenied { order_list_id }
+                        } else {
+                            OrderDeniedReason::TradingStateReducing {
                                 order_side: order.order_side(),
                                 instrument_id: order.instrument_id(),
                             }
-                            .to_string(),
-                        );
+                        };
+                        self.deny_order(order, &reason.to_string());
                     }
                 }
                 _ => {}
